@@ -1,0 +1,18 @@
+# =============================================================================
+# DRM Analysis — Python Dependencies
+# =============================================================================
+# Install all dependencies with:
+# pip install -r requirements.txt
+# =============================================================================
+# Core data manipulation and numerical computing
+numpy>=1.26.0
+pandas>=2.0.0
+
+# Statistical tests (binomial test for VaR backtesting)
+scipy>=1.11.0
+
+# Chart generation (rolling VaR time series and return histograms)
+matplotlib>=3.7.0
+
+# Excel workbook creation and formatting
+openpyxl>=3.1.0

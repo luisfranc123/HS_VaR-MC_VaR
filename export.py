@@ -1,0 +1,875 @@
+"""
+======================================================
+Excel Export
+======================================================
+What this file does:
+Takes the outputs from load_data.py, var,py, rolling_window.py, 
+exceptions.py, and stress_test.py and writes them into a single
+structurred Excel workbook.
+
+Sheets produced: 
+    1. README — methodology notes and column definitions
+    2. SPX Returns — full cleaned return series 
+    3. VaR Summary — rolling day-by-day VaR and exceptions 
+    4. VaR Latest — single-row snapshot for the most recent date
+    5. Stress Test — 9-scenario P&L grid 
+    6. Return Stats — distributional statistics of the lookback window
+    7. VaR Chart — rolling 20-day VaR time series 
+    8. Distributions — return histograms 
+
+Relies on:
+    - load_data.py        
+    - rolling_window.py   
+    - var.py              
+    - exceptions.py       
+    - stress_test.py      
+"""
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")           
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from openpyxl import Workbook
+from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side)
+from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image as XLImage
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from load_data import load_spx
+from rolling_window import describe_window, default_lookback_years, \
+        default_outlier_cutoff, default_MC_draws
+from var import compute_var, default_confidence, default_horizon_days
+from exceptions import run_backtest, compute_exception_stats
+from stress_test import compute_stress_test
+
+# ======================================================
+# Configuration
+# ======================================================
+csv_filename = "spxtr_level_data.csv"
+OUTPUT_FILE = "DRM_Analysis_Output.xlsx"
+cache_file = "backtest_cache.csv"
+chart_temp_dir = "_chart_temp" # temporary folder for chart images
+
+# ======================================================
+# Colour palette
+# ======================================================
+NAVY = "1F3864"
+WHITE = "FFFFFF"
+RED = "C00000"
+GREEN = "375623"
+L_RED = "FFCCCC"
+L_GREEN = "E2EFDA"
+L_BLUE = "DDEEFF"
+GRAY = "F2F2F2"
+D_GRAY = "D9D9D9"
+ORANGE = "ED7D31"
+
+# ======================================================
+# Shared style helpers
+# ======================================================
+THIN_BORDER = Border(
+    left = Side(style="thin", color="BFBFBF"),
+    right = Side(style="thin", color="BFBFBF"),
+    top = Side(style="thin", color="BFBFBF"),
+    bottom = Side(style="thin", color="BFBFBF"),
+)
+
+
+def _hdr(ws, row: int, col: int, value, width: int = None):
+    """Write a navy header cell."""
+    c = ws.cell(row=row, column=col, value=value)
+    c.font = Font(bold=True, color=WHITE, name="Calibri", size=10)
+    c.fill = PatternFill("solid", fgColor=NAVY)
+    c.alignment = Alignment(horizontal="center", vertical="center",
+                             wrap_text=True)
+    c.border = THIN_BORDER
+    if width:
+        ws.column_dimensions[get_column_letter(col)].width = width
+    return c
+
+
+def _cell(ws, row: int, col: int, value,
+          fmt: str = None, bold: bool = False,
+          color: str = "000000", bg: str = None,
+          align: str = "center"):
+    """Write a data cell."""
+    c = ws.cell(row=row, column=col, value=value)
+    c.font = Font(color=color, name="Calibri", size=10, bold=bold)
+    c.alignment = Alignment(horizontal=align, vertical="center")
+    c.border = THIN_BORDER
+    if fmt:
+        c.number_format = fmt
+    if bg:
+        c.fill = PatternFill("solid", fgColor=bg)
+    return c
+
+
+def _section_title(ws, row: int, col: int, value: str, n_cols: int = 1):
+    """Write a section title spanning n_cols columns."""
+    c = ws.cell(row=row, column=col, value=value)
+    c.font = Font(bold=True, color=NAVY, name="Calibri", size=11)
+    c.fill = PatternFill("solid", fgColor=L_BLUE)
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    c.border = THIN_BORDER
+    if n_cols > 1:
+        ws.merge_cells(start_row=row, start_column=col,
+                       end_row=row, end_column=col + n_cols - 1)
+    ws.row_dimensions[row].height = 18
+    return c
+
+
+def _freeze(ws, cell: str = "A2"):
+    ws.freeze_panes = cell
+
+
+def _auto_width(ws, min_w: int = 10, max_w: int = 40):
+    for col in ws.columns:
+        length = max((len(str(c.value or "")) for c in col), default=8)
+        ws.column_dimensions[col[0].column_letter].width = \
+            min(max(length + 2, min_w), max_w)
+
+# ======================================================
+# Sheet 1 — README
+# ======================================================
+def _write_readme(wb: Workbook):
+    ws = wb.create_sheet("README")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 75
+
+    title = ws.cell(row = 1, column = 1, 
+                    value = "DRM Analysis — Methodology and Column Guide")
+    title.font = Font(bold = True, size = 14, name = "Arial", color = NAVY)
+    ws.merge_cells("A1:B1")
+    ws.row_dimensions[1].height = 24
+
+    content = [
+        ("SECTION", "DESCRIPTION"),
+        ("", ""),
+        ("── INPUT DATA ──", ""),
+        ("SPX Returns sheet", "Full SPX total-return index history. "
+         "Returns = (Close_t / Close_{t-1}) - 1."),
+        ("", ""),
+        ("── VaR METHODOLOGY ──", ""),
+        ("Lookback window", "Trailing 3 years (~755 trading days) "
+         "of daily returns."),
+        ("Confidence level", "99% — i.e. the 1st percentile of the "
+         "return distribution."),
+        ("HS-VaR", "1st percentile of the raw historical "
+         "return distribution. No distributional "
+         "assumptions."),
+        ("MC-VaR", "1st percentile of returns resampled "
+         "(with replacement) from the filtered "
+         "pool. Outliers beyond ±3.5% excluded."),
+        ("20-Day VaR", "1-Day VaR * √20  "
+         "(square-root-of-time scaling)."),
+        ("", ""),
+        ("── VaR SUMMARY COLUMNS ──", ""),
+        ("date", "Trading date."),
+        ("actual_return", "Realized SPX daily return."),
+        ("hs_var_1day", "HS 1-Day 99% VaR (negative = loss "
+         "threshold)."),
+        ("mc_var_1day", "MC 1-Day 99% VaR."),
+        ("hs_var_scaled", "HS VaR scaled to the chosen horizon."),
+        ("mc_var_scaled", "MC VaR scaled to the chosen horizon."),
+        ("exception_hs", "1 if actual_return < hs_var_1day "
+         "(breach), else 0."),
+        ("exception_mc", "1 if actual_return < mc_var_1day, "
+         "else 0."),
+        ("", ""),
+        ("—— STRESS TEST COLUMNS ──", ""),
+        ("rm_code", "Scenario: RM01 = -40%, …, RM00=0%, "
+         "…, RM08=+40%."),
+        ("shock_pct", "Hypothetical index move applied to "
+         "current SPX level."),
+        ("spx_stressed", "SPX level after applying the shock."),
+        ("pl_pct", "Portfolio P&L as % of NAV "
+         "(= beta * shock)."),
+        ("pl_dollars", "Dollar P&L = pl_pct * NAV."),
+        ("position_value", "Portfolio value after shock "
+         "= NAV + pl_dollars."),
+        ("", ""),
+        ("── EXCEPTION NOTES ──", ""),
+        ("Expected rate", "At 99% confidence, ~1% of days should "
+         "be exceptions."),
+        ("Traffic light", "GREEN ≤ 1.5*, YELLOW ≤ 3*, RED > 3* "
+         "the expected rate."),
+        ("Backtesting", "Comparing observed exception rate to "
+         "expected 1% validates model calibration."),
+        ("Clustering", "Exceptions appearing in the same year "
+         "signal regime failures, not random noise."),
+    ]
+
+    for i, (col_a, col_b) in enumerate(content, start = 2):
+        a = ws.cell(row = i, column = 1, value = col_a)
+        b = ws.cell(row = i, column = 2, value = col_b)
+        if col_a == "SECTION":
+            for c in (a, b):
+                c.font = Font(bold = True, color = WHITE, name = "Arial", size = 10)
+                c.fill = PatternFill("solid", fgColor = NAVY)
+        elif col_a.startswith("——"):
+            for c in (a, b):
+                c.font = Font(bold = True, color = NAVY, name = "Arial", size = 10)
+                c.fill = PatternFill("solid", fgColor = L_BLUE)
+        else: 
+            a.font = Font(bold = True, color = "000000", name = "Arial", size = 10)
+            a.fill = PatternFill("solid", fgColor = GRAY)
+            b.font = Font(color = "000000", name = "Calibri", size = 10)
+        b.alignment = Alignment(wrap_text = True, vertical = "top")
+        ws.row_dimensions[i].height = 16
+
+# ======================================================
+# Sheet 2 — SPX Returns
+# ======================================================
+def _write_spx_returns(wb: Workbook, spx: pd.DataFrame): 
+    ws = wb.create_sheet("SPX Returns")
+    _section_title(ws, 1, 1, "SPX Total Return Index - Daily History", 3)
+
+    headers = ["Date", "SPX Close", "Daily Return"]
+    widths = [14, 14, 16]
+    for c, (h, w) in enumerate(zip(headers, widths), 1):
+        _hdr(ws, 2, c, h, w)
+    
+    for r, row in enumerate(spx.itertuples(index = False), 3):
+        bg = GRAY if r % 2 == 0 else None
+        _cell(ws, r, 1, row.date.date(), fmt = "YYYY-MM-DD", bg = bg)
+        _cell(ws, r, 2, row.close, fmt = "#,##0.00", bg = bg)
+        ret_color = RED if row.daily_return < 0 else GREEN
+        _cell(ws, r, 3, row.daily_return, fmt = "0.000%",
+              color = ret_color, bg = bg)
+    
+    _freeze(ws, "A3")
+    ws.auto_filter.ref = "A2:C2"
+
+# ======================================================
+# Sheet 3 — VaR Summary
+# ======================================================
+def _write_var_summary(wb: Workbook, bt: pd.DataFrame):
+    ws = wb.create_sheet("VaR Summary")
+    _section_title(ws, 1, 1, 
+                   "Rolling VaR - Day-by-day Backtesting Results", 9)
+    headers = ["Date", "SPX Close", "Actual Return", 
+              "HS VaR 1D", "MC VaR 1D", "HS VaR Scaled", 
+              "MC VaR Scaled", "Exception HS", "Exception MC"]
+    widths = [13, 12, 15, 13, 13, 14, 14, 14, 14]
+
+    for c, (h, w) in enumerate(zip(headers, widths), 1):
+        _hdr(ws, 2, c, h, w)
+
+    for r, row in enumerate(bt.itertuples(index = False), 3):
+        bg = GRAY if r % 2 == 0 else None
+        _cell(ws, r, 1, row.date.date(), fmt = "YYY-MM-DD", bg = bg)
+        _cell(ws, r, 2, row.spx_close if hasattr(row, "spx_close")
+              else None, fmt = "#, ##0.00", bg = bg)
+        _cell(ws, r, 3, row.actual_return, fmt = "0.000%", 
+              color = RED if row.actual_return < 0 else GREEN, bg = bg)
+        _cell(ws, r, 4, row.hs_var_1day, fmt="0.000%", color=RED, bg=bg)
+        _cell(ws, r, 5, row.mc_var_1day, fmt="0.000%", color=RED, bg=bg)
+        _cell(ws, r, 6, row.hs_var_scaled, fmt="0.000%", color=RED, bg=bg)
+        _cell(ws, r, 7, row.mc_var_scaled, fmt="0.000%", color=RED, bg=bg)
+
+        for col, exc in [(8, row.exception_hs), (9, row.exception_mc)]:
+            if exc == 1:
+                _cell(ws, r, col, "BREACH", color = RED, 
+                      bold = True, bg = L_RED)
+            else:
+                _cell(ws, r, col, "OK", color = GREEN, bg = L_GREEN)
+    
+    _freeze(ws, "A3")
+    ws.auto_filter.ref = "A2:I2"
+
+# ======================================================
+# Sheet 4 — VaR Latest
+# ======================================================
+def _write_var_latest(wb: Workbook, bt: pd.DataFrame, 
+                      confidence: float, horizon_days: int):
+    ws = wb.create_sheet("VaR Latest")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 22
+
+    _section_title(ws, 1, 1, "VaR Snapshot - Most Recent Date", 3)
+
+    latest = bt.iloc[-1]
+    prev = bt.iloc[-2] if len(bt) > 1 else latest
+
+    _hdr(ws, 2, 1, "Metric")
+    _hdr(ws, 2, 2, f"T1 ({latest['date'].date()})")
+    _hdr(ws, 2, 3, f"T0 ({prev['date'].date()})")
+
+    pct_rows = {
+        "HS-VaR 1-Day (99%)", "MC-VaR 1-Day (99%)", 
+        f"HS-VaR {horizon_days}-Day", 
+        f"MC-VaR {horizon_days}-Day", 
+        "Actual Return"}
+    
+    rows_data = [
+        ("Calculation Date",
+         str(latest["date"].date()), str(prev["date"].date())),
+        ("Actual Return",
+         latest["actual_return"], prev["actual_return"]),
+        ("HS-VaR 1-Day (99%)",
+         latest["hs_var_1day"], prev["hs_var_1day"]),
+        ("MC-VaR 1-Day (99%)",
+         latest["mc_var_1day"], prev["mc_var_1day"]),
+        (f"HS-VaR {horizon_days}-Day",
+         latest["hs_var_scaled"], prev["hs_var_scaled"]),
+        (f"MC-VaR {horizon_days}-Day",
+         latest["mc_var_scaled"], prev["mc_var_scaled"]),
+        ("Exception HS",
+         "BREACH" if latest["exception_hs"] else "OK",
+         "BREACH" if prev["exception_hs"]   else "OK"),
+        ("Exception MC",
+         "BREACH" if latest["exception_mc"] else "OK",
+         "BREACH" if prev["exception_mc"]   else "OK"),
+    ]
+
+    for r, (label, t1, t0) in enumerate(rows_data, 3):
+        bg = GRAY if r % 2 == 0 else None
+        ws.cell(row = r, column = 1, value = label).font = \
+        Font(bold = True, name = "Arial", size = 10)
+        ws.cell(row = r, column = 1).fill = \
+        PatternFill("solid", fgColor = D_GRAY)
+        ws.cell(row = r, column = 1).border = THIN_BORDER
+
+        fmt = "0.000%" if label in pct_rows else None
+        for col, val in [(2, t1), (3, t0)]:
+            if label.startswith("Exception"):
+                exc_bg = L_RED if val == "BREACH" else L_GREEN
+                exc_color = RED     if val == "BREACH" else GREEN
+                _cell(ws, r, col, val, color=exc_color, bg = exc_bg)
+            else:
+                _cell(ws, r, col, val, fmt = fmt, bg = bg)
+
+# ======================================================
+# Sheet 5 — Stress test
+# ======================================================
+def _write_stress_test(wb: Workbook, stress_result: dict):
+    ws = wb.create_sheet("Stress test")
+    ws.sheet_view.showGridLines = False
+
+    spx_level = stress_result["spx_level"]
+    nav = stress_result["portfolio_value"]
+    beta = stress_result["beta"]
+    date = stress_result["as_of_date"].date()
+
+    _section_title(ws, 1, 1, 
+                   f"Stress Test  | As of {date}  |  "
+                   f"SPX: {spx_level:.2f}  |  "
+                   f"NAV: ${nav:,.0f}  |  Beta: {beta}", 7)
+    
+    def write_grid(ws, start_row: int,
+                   grid: pd.DataFrame, title: str):
+        _section_title(ws, start_row, 1, title, 7)
+        headers = ["Scenario", "Shock %", "SPX Current",
+                   "SPX Stressed", "P&L %", "P&L ($)", "Position ($)"]
+        widths  = [11, 10, 14, 14, 10, 15, 16]
+        for c, (h, w) in enumerate(zip(headers, widths), 1):
+            _hdr(ws, start_row + 1, c, h, w)
+
+        for r, row in enumerate(grid.itertuples(index=False),
+                                start_row + 2):
+            shock = row.shock_pct
+            if shock < 0:
+                bg, tc = L_RED,   RED
+            elif shock > 0:
+                bg, tc = L_GREEN, GREEN
+            else:
+                bg, tc = L_BLUE,  NAVY
+            _cell(ws, r, 1, row.rm_code, bold=True, color=NAVY, bg=bg)
+            _cell(ws, r, 2, shock, fmt="0%", bg=bg, color=tc)
+            _cell(ws, r, 3, row.spx_current, fmt="#,##0.00", bg=bg)
+            _cell(ws, r, 4, row.spx_stressed, fmt="#,##0.00", bg=bg)
+            _cell(ws, r, 5, row.pl_pct, fmt="+0.00%;-0.00%",
+                  bg=bg, color=tc)
+            _cell(ws, r, 6, row.pl_dollars,
+                  fmt='#,##0;[Red]-#,##0;"-"', bg=bg, color=tc)
+            _cell(ws, r, 7, row.position_value,  fmt="#,##0", bg=bg)
+
+    # Grid 1 starts at row 3, Grid 2 starts 14 rows below Grid 1
+    n_rows = len(stress_result["grid1"])
+    write_grid(ws, 3, stress_result["grid1"], 
+               "GRID 1 - Current Vols (market move only)")
+    write_grid(ws, 3 + n_rows + 4, stress_result["grid2"],
+               f"GRID 2 — Stressed Vols  "
+               f"(market move + {stress_result['vol_multiplier']:.0f}* vol)")
+    
+    # Greeks sectn
+    greeks_row = 3 + 2*(n_rows + 4) + 2
+    _section_title(ws, greeks_row, 1, "Greeks - Base Case (RM00)", 3)
+    base = stress_result["grid1"][stress_result["grid1"]["rm_code"] == "RM00"].iloc[0]
+
+    greek_rows = [
+        ("Delta ($ per SPX point)", base["delta"], "#,##0.00"),
+        ("Gamma (delta Δ per SPX point)", base["gamma"], "#,##0.0000"),
+        ("Vega ($ per 1 vol point)", base["vega"], "#,##0.00"),
+        ("Theta ($ per trading day)", base["theta"], "#,##0.00"),
+        ("Rho ($ per 1% rate move)", base["rho"], "#,##0.00"),
+    ]
+
+    for i, (label, val, fmt) in enumerate(greek_rows, greeks_row + 1):
+        ws.cell(row = i, column = 1, value = label).font = \
+            Font(bold = True, name = "Arial", size = 10)
+        ws.cell(row = i, column = 1).fill = \
+            PatternFill("solid", fgColor = GRAY)
+        ws.cell(row = i, column = 1).border = THIN_BORDER
+        ws.column_dimensions["A"].width = 34
+        _cell(ws, i, 2, val, fmt = fmt)
+
+# ======================================================
+# Sheet 6 — Return Statistics
+# ======================================================
+def _write_return_stats(wb: Workbook, spx: pd.DataFrame, 
+                        lookback_years: int, outlier_cutoff: float):
+    
+    ws = wb.create_sheet("Return Stats")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 35
+    ws.column_dimensions["B"].width = 20
+    ws.column_dimensions["C"].width = 20
+
+    latest_date  = spx["date"].max()
+    cutoff = latest_date - pd.DateOffset(years=lookback_years)
+    window_rets = spx[(spx["date"] > cutoff) &
+                       (spx["date"] <= latest_date)]["daily_return"]
+    full_rets = spx["daily_return"]
+
+    _section_title(ws, 1, 1, "Return Distribution Statistics", 3)
+    _hdr(ws, 2, 1, "Statistic")
+    _hdr(ws, 2, 2, f"{lookback_years}-Year Window")
+    _hdr(ws, 2, 3, "Full History")
+
+    stats = [
+        ("As-of Date", str(latest_date.date()), str(spx["date"].max().date())),
+        ("Start Date", str(cutoff.date()), str(spx["date"].min().date())),
+        ("Observations", len(window_rets), len(full_rets)),
+        ("Mean Daily Return", window_rets.mean(), full_rets.mean()),
+        ("Median Daily Return", window_rets.median(), full_rets.median()),
+        ("Std Dev (Daily)", window_rets.std(), full_rets.std()),
+        ("Min (Worst Day)", window_rets.min(), full_rets.min()),
+        ("Max (Best Day)", window_rets.max(), full_rets.max()),
+        ("1st Pctile (VaR)", window_rets.quantile(0.01), full_rets.quantile(0.01)),
+        ("5th Percentile", window_rets.quantile(0.05), full_rets.quantile(0.05)),
+        ("Kurtosis", window_rets.kurt(), full_rets.kurt()),
+        ("Skewness", window_rets.skew(), full_rets.skew()),
+        ("% Positive Days", (window_rets > 0).mean(), (full_rets > 0).mean()),
+        ("% Negative Days", (window_rets < 0).mean(), (full_rets < 0).mean()),
+        ("Annualised Return", window_rets.mean() * 252, full_rets.mean() * 252),
+        ("Annualised Vol", window_rets.std() * 252**0.5, full_rets.std() * 252**0.5),
+        (f"Outliers (|r|>{outlier_cutoff:.1%})",
+         int((window_rets.abs() > outlier_cutoff).sum()),
+         int((full_rets.abs() > outlier_cutoff).sum())),
+    ]
+
+    pct_labels = {"Mean Daily Return", "Median Daily Return", "Std Dev (Daily)",
+                  "Min (Worst Day)", "Max (Best Day)", "1st Pctile (VaR)",
+                  "5th Percentile", "% Positive Days", "% Negative Days",
+                  "Annualised Return", "Annualised Vol"}
+    
+    for r, (label, win_val, full_val) in enumerate(stats, 3):
+        bg = GRAY if r % 2 == 0 else None
+        ws.cell(row = r, column = 1, value = label).font = \
+            Font(bold = True, name = "Arial", size = 10)
+        ws.cell(row = r, column = 1).fill = \
+            PatternFill("solid", fgColor = D_GRAY if bg else GRAY)
+        ws.cell(row = r, column = 1).border = THIN_BORDER
+        fmt = "0.0000%" if label in pct_labels else \
+              ("#,##0" if isinstance(win_val, (int, float)) and
+               abs(win_val) > 1 else "0.0000")
+        _cell(ws, r, 2, win_val,  fmt = fmt, bg = bg)
+        _cell(ws, r, 3, full_val, fmt = fmt, bg = bg)
+
+    
+# ======================================================
+# Chart helpers
+# ======================================================
+def _ensure_chart_dir():
+    chart_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             chart_temp_dir)
+    os.makedirs(chart_dir, exist_ok=True)
+    return chart_dir
+
+def _cleanup_chart_dir():
+    import shutil
+    chart_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             chart_temp_dir)
+    if os.path.exists(chart_dir):
+        shutil.rmtree(chart_dir)
+
+def _save_fig(fig, filename: str) -> str:
+    chart_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             chart_temp_dir)
+    path = os.path.join(chart_dir, filename)
+    fig.savefig(path, dpi = 150, bbox_inches = "tight",
+                facecolor = "white", edgecolor = "none")
+    plt.close(fig)
+    return path
+
+# ======================================================
+# Sheet 7 — Rolling VaR Chart
+# ======================================================
+def _make_var_chart(bt: pd.DataFrame, 
+                    horizon_days: int, 
+                    confidence: float) -> str:
+    """ 
+    Replicate rollong VaR time series. 
+    """
+    fig, ax = plt.subplots(figsize = (13, 5))
+
+    dates = bt["date"]
+    var_pos = bt["hs_var_scaled"].abs()
+
+    ax.plot(dates, var_pos, color = "#C00000", linewidth = 1.2, zorder = 3)
+
+    # Shade crisis periods for context
+    ax.set_title(
+        f"SPX VaR  |  {confidence:.0%} confidence  |  "
+        f"{horizon_days}-day horizon  |  3-year rolling window",
+        fontsize=12, fontweight="bold", pad=12)
+    ax.set_xlabel("Date", fontsize=10)
+    ax.set_ylabel("VaR  (%)", fontsize=10)
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=1))
+    ax.set_xlim(dates.min(), dates.max())
+    ax.set_ylim(0, var_pos.max() * 1.10)
+    ax.grid(True, linestyle="--", alpha=0.4, zorder=0)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    # Annotate the peak (financial crisis)
+    peak_idx = var_pos.idxmax()
+    ax.annotate(
+        f"Peak: {var_pos[peak_idx]:.1%}\n{bt['date'][peak_idx].strftime('%b %Y')}",
+        xy=(bt["date"][peak_idx], var_pos[peak_idx]),
+        xytext=(30, -25), textcoords="offset points",
+        arrowprops=dict(arrowstyle="->", color="black", lw=0.8),
+        fontsize=8, color="black")
+    
+    fig.tight_layout()
+    return _save_fig(fig, "var_timeseries.png")
+
+def _write_var_chart(wb: Workbook, chart_path: str):
+    ws = wb.create_sheet("VaR Chart")
+    ws.sheet_view.showGridLines = False
+    _section_title(ws, 1, 1,
+                   "Rolling VaR Time Series — SPX  "
+                   "(3-year window, 99% confidence)", 1)
+    img = XLImage(chart_path)
+    img.anchor = "A3"
+    ws.add_image(img)
+
+# ======================================================
+# Sheet 8 — Return Distributions
+# ======================================================
+def _make_distribution_charts(spx: pd.DataFrame, 
+                              window_data: dict, 
+                              mc_simulated: np.ndarray) -> list:
+    """
+    Produce the histogram panels. 
+    """
+    paths = []
+
+    full_rets = spx["daily_return"].values
+    window_rets = window_data["full_window"].values
+    pool_rets = window_data["filtered_pool"].values
+    n_window = len(window_rets)
+    n_full = len(full_rets)
+    n_mc = len(mc_simulated)
+    cutoff = window_data["outlier_cutoff"]
+
+    # --- 3-year window ---
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    ax.hist(window_rets, bins=60, color="#1F77B4", edgecolor="white",
+            linewidth=0.3, alpha=0.85)
+    var_1pct = float(np.percentile(window_rets, 1))
+    ax.axvline(var_1pct, color="#C00000", linewidth=1.5,
+               linestyle="--", label=f"1st pctile: {var_1pct:.3f}")
+    ax.set_title(
+        f"SPX {window_data['lookback_years']}Y Window — "
+        f"{n_window:,} Daily Returns\n"
+        f"[{window_rets.min():.4f},  {window_rets.max():.4f}]  "
+        f"μ={window_rets.mean():.5f}  σ={window_rets.std():.5f}",
+        fontsize=9)
+    ax.set_xlabel("Daily Return", fontsize=9)
+    ax.set_ylabel("Frequency", fontsize=9)
+    ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=1))
+    ax.legend(fontsize=8)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    paths.append(_save_fig(fig, "dist_window.png"))
+
+    # --- MC simulated distribution ---
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    ax.hist(mc_simulated, bins=60, color="#1F77B4", edgecolor="white",
+            linewidth=0.3, alpha=0.85)
+    mc_var = float(np.percentile(mc_simulated, 1))
+    ax.axvline(mc_var, color="#C00000", linewidth=1.5,
+               linestyle="--", label=f"MC VaR (1%): {mc_var:.3f}")
+
+    # Show left tail values above the chart 
+    left_tail = np.sort(mc_simulated)[:10]
+    tail_str  = ",  ".join(f"{v:.5f}" for v in left_tail)
+    ax.set_title(
+        f"MC Distribution — {n_mc:,} Simulated Returns\n"
+        f"[{mc_simulated.min():.4f},  {mc_simulated.max():.4f}]  "
+        f"μ={mc_simulated.mean():.5f}  σ={mc_simulated.std():.5f}\n"
+        f"Left tail: {tail_str[:60]}...",
+        fontsize=8)
+    ax.set_xlabel("Simulated Return", fontsize=9)
+    ax.set_ylabel("Frequency", fontsize=9)
+    ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=1))
+    ax.legend(fontsize=8)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    paths.append(_save_fig(fig, "dist_mc.png"))
+
+    # --- Full SPX history ---
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    ax.hist(full_rets, bins=100, color="#1F77B4", edgecolor="white",
+            linewidth=0.2, alpha=0.85)
+    full_var = float(np.percentile(full_rets, 1))
+    ax.axvline(full_var, color="#C00000", linewidth=1.5,
+               linestyle="--", label=f"1st pctile: {full_var:.3f}")
+    n_out_d = int((full_rets < -cutoff).sum())
+    n_out_u = int((full_rets >  cutoff).sum())
+    ax.set_title(
+        f"SPX Full History — {n_full:,} Daily Returns\n"
+        f"[{full_rets.min():.4f},  {full_rets.max():.4f}]  "
+        f"μ={full_rets.mean():.5f}  σ={full_rets.std():.5f}\n"
+        f"Outliers (|r|>{cutoff:.1%}): down={n_out_d}  up={n_out_u}",
+        fontsize=9)
+    ax.set_xlabel("Daily Return", fontsize=9)
+    ax.set_ylabel("Frequency", fontsize=9)
+    ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=1))
+    ax.legend(fontsize=8)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    paths.append(_save_fig(fig, "dist_full.png"))
+
+    # --- Filtered pool/MCHist ---
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    ax.hist(pool_rets, bins=60, color="#1F77B4", edgecolor="white",
+            linewidth=0.3, alpha=0.85)
+    pool_var = float(np.percentile(pool_rets, 1))
+    ax.axvline(pool_var, color="#C00000", linewidth=1.5,
+               linestyle="--", label=f"1st pctile: {pool_var:.3f}")
+    n_out_pool = int((np.abs(window_rets) > cutoff).sum())
+    ax.set_title(
+        f"SPX Filtered Pool — {len(pool_rets):,} Returns\n"
+        f"(3Y window, outliers |r|>{cutoff:.1%} removed — "
+        f"{n_out_pool} excluded)\n"
+        f"[{pool_rets.min():.4f},  {pool_rets.max():.4f}]  "
+        f"μ={pool_rets.mean():.5f}  σ={pool_rets.std():.5f}",
+        fontsize=9)
+    ax.set_xlabel("Daily Return", fontsize=9)
+    ax.set_ylabel("Frequency", fontsize=9)
+    ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=1))
+    ax.legend(fontsize=8)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    paths.append(_save_fig(fig, "dist_pool.png"))
+
+    return paths
+
+def _write_distributions(wb: Workbook, chart_paths: list):
+    ws = wb.create_sheet("Distributions")
+    ws.sheet_view.showGridLines = False
+
+    titles = [
+        (1, "A3", "3-Year Window — Historical Returns"),
+        (1, "K3", "MC Simulated Distribution"),
+        (30, "A3", "Full SPX History (all years)"),
+        (30, "K3", "Filtered Pool (outliers removed)"),
+    ]
+
+    anchors = ["A3", "K3", "A33", "K33"]
+    labels  = [
+        "3-Year Window — Historical Returns",
+        "MC Simulated Distribution",
+        "Full SPX History (all years)",
+        "Filtered Pool (outliers removed)",
+    ]
+
+    _section_title(ws, 1, 1,
+                   "Return Distributions — Historical and Simulated", 20)
+
+    for path, anchor, label in zip(chart_paths, anchors, labels):
+        img = XLImage(path)
+        img.anchor = anchor
+        ws.add_image(img)
+
+# ======================================================
+# Cache helpers 
+# ======================================================
+def load_or_run_backtest(spx: pd.DataFrame, 
+                         lookback_years: int, 
+                         outlier_cutoff: float, 
+                         mc_draws: int, 
+                         horizon_days: int, 
+                         confidence: float, 
+                         cache_path: str) -> pd.DataFrame:
+    """
+    Load the backtest DataFrame from cache if it exists, 
+    otherwise run the full rolling backtest and save to cache. 
+
+    The cache filename encodes the key parameters so that changing 
+    any parameter automatically triggers a fresh recalculation.
+    """
+    # encode parameters into cache filename
+    param_tag = (f"ly{lookback_years}_oc{int(outlier_cutoff*1000)}"
+                 f"_mc{mc_draws}_h{horizon_days}"
+                 f"_c{int(confidence*100)}")
+    base, ext = os.path.splitext(cache_path)
+    tagged_cache = f"{base}_{param_tag}{ext}"
+
+    if os.path.exists(tagged_cache):
+        print(f"[Cache] Loading backtest from {tagged_cache}")
+        bt = pd.read_csv(tagged_cache, parse_dates = ["date"])
+        print(f"[Cache] Loaded {len(bt):,} rows.")
+        return bt
+    
+    print(f"[Cache] No cache found. Running full backtest...")
+    print(f"This takes ~2 minutes. Results will be cached for next run.")
+    bt = run_backtest(
+        spx,
+        lookback_years = lookback_years,
+        outlier_cutoff = outlier_cutoff,
+        mc_draws = mc_draws,
+        horizon_days = horizon_days,
+        confidence = confidence,
+    )
+
+    # Add spx_close to the backtest DataFrame for sheet 3
+    bt = bt.merge(
+        spx[["date", "close"]].rename(columns = {"close": "spx_close"}), 
+        on = "date", how = "left")
+    
+    bt.to_csv(tagged_cache, index = False)
+    print(f"[Cache] Saved to {tagged_cache}")
+    return bt
+
+# ======================================================
+# Export function 
+# ======================================================
+def export(spx: pd.DataFrame, 
+           lookback_years: int = default_lookback_years, 
+           outlier_cutoff: float = default_outlier_cutoff, 
+           mc_draws: int = default_MC_draws, 
+           horizon_days: int = default_horizon_days, 
+           confidence: float = default_confidence, 
+           portfolio_value: float = 10_000_000.0, 
+           beta: float = 1.0, 
+           vol_multiplier: float = 2.0, 
+           output_path: str = None, 
+           cache_path: str = None):
+    """
+    Run the full export pipeline and write the Excel workbook.
+
+    Parameters: 
+    - spx: full SPX DataFrame from load_spx()
+    - lookback_years: VaR lookback window in years
+    - outlier_cutoff: MC outlier filter threshold
+    - mc_draws: number of MC draws
+    - horizon_days: VaR scaling horizon in trading days
+    - confidence: VaR confidence level
+    - portfolio_value: portfolio NAV for stress test
+    - beta: portfolio beta for stress test
+    - vol_multiplier: vol scaling for stress test Grid 2
+    - output_path: path for the output .xlsx file
+    - cache_path: path for the backtest cache .csv file
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_file = output_path or os.path.join(script_dir, OUTPUT_FILE)
+    cache_path = cache_path or os.path.join(script_dir, cache_file)
+    _ensure_chart_dir() 
+
+    
+
+    # --- window data for the most recent date ---
+    print("\n[Export] Building window data...")
+    latest_date = spx["date"].max()
+    window_data = describe_window(
+        spx, latest_date, lookback_years, outlier_cutoff, mc_draws)
+
+    # --- VaR for the most recent date ---
+    print("[Export] Computing latest VaR...")
+    var_result = compute_var(
+        window_data, confidence=confidence, horizon_days=horizon_days)
+    mc_simulated = var_result["mc_simulated"]
+
+    # --- Rolling backtest (cached) ---
+    bt = load_or_run_backtest(
+        spx, lookback_years, outlier_cutoff,
+        mc_draws, horizon_days, confidence, cache_path)
+
+    # --- Stress test ---
+    print("[Export] Running stress test...")
+    stress_result = compute_stress_test(
+        spx,
+        portfolio_value = portfolio_value,
+        beta = beta,
+        vol_multiplier = vol_multiplier,
+    )
+
+    # --- Build charts ---
+    print("[Export] Generating charts...")
+    var_chart_path  = _make_var_chart(bt, horizon_days, confidence)
+    dist_chart_paths = _make_distribution_charts(
+        spx, window_data, mc_simulated)
+
+    # --- Build workbook ---
+    print("[Export] Building workbook...")
+    wb = Workbook()
+    wb.remove(wb.active)        # remove default blank sheet
+
+    _write_readme(wb)
+    _write_spx_returns(wb, spx)
+    _write_var_summary(wb, bt)
+    _write_var_latest(wb, bt, confidence, horizon_days)
+    _write_stress_test(wb, stress_result)
+    _write_return_stats(wb, spx, lookback_years, outlier_cutoff)
+    _write_var_chart(wb, var_chart_path)
+    _write_distributions(wb, dist_chart_paths)
+
+    wb.save(output_file)
+    print(f"[Export] Workbook saved -> {output_file}")
+
+    _cleanup_chart_dir()
+    print("[Export] Temporary chart files cleaned up.")
+    return output_file
+
+# ======================================================
+# Entry Point
+# ======================================================
+if __name__ == "__main__":
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(script_dir, csv_filename)
+
+    print("\n" + "=" * 65)
+    print("DRM ANALYSIS — EXCEL EXPORT")
+    print("=" * 65)
+
+    spx = load_spx(csv_path)
+    print(f"SPX data loaded: {len(spx):,} days "
+          f"({spx['date'].min().date()} -> {spx['date'].max().date()})")
+    
+    output_path = export(spx)
+
+    print("\n" + "=" * 65)
+    print("EXPORT COMPLETE")
+    print(f"Output: {output_path}")
+    print("=" * 65)
+
+
+
+
+         
+              
+        
