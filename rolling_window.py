@@ -182,13 +182,13 @@ def prompt_parameters() -> tuple:
     print("=" * 65)
 
     # --- Lookback years ---
-    raw = int(input(f"\nLookback window in years [default = {default_lookback_years}]: ").strip())
+    raw = input(f"\nLookback window in years [default = {default_lookback_years}]: ").strip()
     
     if raw == "":
         lookback_years = default_lookback_years
     else:
         try:
-            lookback_years = raw
+            lookback_years = int(raw)
             if lookback_years < 1 or lookback_years > 20:
                 print("Out of range (1-20). Using default")
                 lookback_years = default_lookback_years
@@ -197,12 +197,12 @@ def prompt_parameters() -> tuple:
             lookback_years = default_lookback_years
 
     # --- Outlier cutoff ---
-    raw = float(input(f"\nOutlier cutoff (decimal) [default = {default_outlier_cutoff}]: ").strip())
+    raw = input(f"\nOutlier cutoff (decimal) [default = {default_outlier_cutoff}]: ").strip()
     if raw == "":
         outlier_cutoff = default_outlier_cutoff
     else:
         try:
-            outlier_cutoff = raw
+            outlier_cutoff = float(raw)
             if outlier_cutoff < 0.01 or outlier_cutoff > 0.20:
                 print("Out of range (0.01 - 0.20). Using default.")
                 outlier_cutoff = default_outlier_cutoff
@@ -211,12 +211,12 @@ def prompt_parameters() -> tuple:
             outlier_cutoff = default_outlier_cutoff
 
     # --- MC draws ---
-    raw = int(input(f"\nMonte Carlo draws [default = {default_MC_draws}]: ").strip())
+    raw = input(f"\nMonte Carlo draws [default = {default_MC_draws}]: ").strip()
     if raw == "":
         mc_draws = default_MC_draws
     else:
         try:
-            mc_draws = raw
+            mc_draws = int(raw)
             if mc_draws < 100 or mc_draws > 100_000:
                 print("Out of range (100 - 100_000). Using default.")
                 mc_draws = default_MC_draws

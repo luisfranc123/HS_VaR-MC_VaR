@@ -44,6 +44,8 @@ from rolling_window import describe_window, default_lookback_years, \
 from var import compute_var, default_confidence, default_horizon_days
 from exceptions import run_backtest, compute_exception_stats
 from stress_test import compute_stress_test
+from read_positions import (find_drm_files, prompt_account_selection, 
+                            load_account, prompt_scenario_parameters)
 
 # ======================================================
 # Configuration
@@ -52,6 +54,7 @@ csv_filename = "spxtr_level_data.csv"
 OUTPUT_FILE = "DRM_Analysis_Output.xlsx"
 cache_file = "backtest_cache.csv"
 chart_temp_dir = "_chart_temp" # temporary folder for chart images
+worksheet_folder = "Worksheets"
 
 # ======================================================
 # Colour palette
@@ -285,7 +288,10 @@ def _write_var_summary(wb: Workbook, bt: pd.DataFrame):
 # Sheet 4 — VaR Latest
 # ======================================================
 def _write_var_latest(wb: Workbook, bt: pd.DataFrame, 
-                      confidence: float, horizon_days: int):
+                      confidence: float, horizon_days: int, 
+                      var_result: dict = None, 
+                      account_meta: dict = None):
+    
     ws = wb.create_sheet("VaR Latest")
     ws.sheet_view.showGridLines = False
     ws.column_dimensions["A"].width = 30
@@ -321,12 +327,35 @@ def _write_var_latest(wb: Workbook, bt: pd.DataFrame,
         (f"MC-VaR {horizon_days}-Day",
          latest["mc_var_scaled"], prev["mc_var_scaled"]),
         ("Exception HS",
-         "BREACH" if latest["exception_hs"] else "OK",
-         "BREACH" if prev["exception_hs"]   else "OK"),
+         "Breach" if latest["exception_hs"] else "Ok",
+         "Breach" if prev["exception_hs"]   else "Ok"),
         ("Exception MC",
-         "BREACH" if latest["exception_mc"] else "OK",
-         "BREACH" if prev["exception_mc"]   else "OK"),
+         "Breach" if latest["exception_mc"] else "Ok",
+         "Breach" if prev["exception_mc"]   else "Ok"),
     ]
+
+       # When fund VaR was computed, add rows below the SPX VaR rows
+    if var_result and var_result.get("fund_var_1day") is not None:
+        rows_data.append(("─" * 28, "", ""))
+        rows_data.append(("Fund VaR 1-Day (ours)",
+                          var_result["fund_var_1day"], None))
+        rows_data.append((f"Fund VaR {horizon_days}-Day (ours)",
+                          var_result["fund_var_scaled"], None))
+        rows_data.append(("VaR Ratio (fund / SPX)",
+                          var_result["fund_var_ratio"], None))
+        if account_meta:
+            rows_data.append(("─" * 28, "", ""))
+            rows_data.append(("DRM Fund VaR 1-Day",
+                              account_meta.get("drm_fund_var_1d"), None))
+            rows_data.append((f"DRM Fund VaR 20-Day",
+                              account_meta.get("drm_fund_var_20d"), None))
+            rows_data.append(("DRM VaR Ratio",
+                              account_meta.get("drm_var_ratio"), None))
+        pct_rows.update({
+            "Fund VaR 1-Day (ours)",
+            f"Fund VaR {horizon_days}-Day (ours)",
+            "DRM Fund VaR 1-Day", "DRM Fund VaR 20-Day",
+        })
 
     for r, (label, t1, t0) in enumerate(rows_data, 3):
         bg = GRAY if r % 2 == 0 else None
@@ -349,6 +378,7 @@ def _write_var_latest(wb: Workbook, bt: pd.DataFrame,
 # Sheet 5 — Stress test
 # ======================================================
 def _write_stress_test(wb: Workbook, stress_result: dict):
+    
     ws = wb.create_sheet("Stress test")
     ws.sheet_view.showGridLines = False
 
@@ -375,7 +405,7 @@ def _write_stress_test(wb: Workbook, stress_result: dict):
                                 start_row + 2):
             shock = row.shock_pct
             if shock < 0:
-                bg, tc = L_RED,   RED
+                bg, tc = L_RED, RED
             elif shock > 0:
                 bg, tc = L_GREEN, GREEN
             else:
@@ -705,6 +735,232 @@ def _write_distributions(wb: Workbook, chart_paths: list):
         ws.add_image(img)
 
 # ======================================================
+# Sheet 9 — Positions  (account mode only)
+# ======================================================
+def _write_positions(wb: Workbook, positions: list, account: str):
+    """
+    Write the 19 base positions with the computed Greeks
+    side by side with DRM workbook's Greeks.
+    """
+    from greeks import compute_greeks
+
+    ws = wb.create_sheet("Positions")
+    ws.sheet_view.showGridLines = False
+
+    _section_title(ws, 1, 1, 
+                   f"Option Positions — {account.upper()}  "
+                   f"(VAR0000 Base Case, MAGS excluded)", 14)
+    headers = ["Symbol", "Type", "Qty", "Underlying $",
+               "Strike", "T Days", "Sigma",
+               "Our THV", "DRM THV", "THV Diff",
+               "Our Delta $", "DRM Delta $",
+               "Our Vega", "DRM Vega"]
+    widths = [22, 5, 10, 13, 10, 8, 7,
+              12, 12, 10, 13, 13,
+              11, 11 ]
+    
+    for c, (h, w) in enumerate(zip(headers, widths), 1):
+        _hdr(ws, 2, c, h, w)
+    
+    for r, p in enumerate(positions, 3):
+        bg = GRAY if r% 2 == 0 else None
+
+        # Compute Greeks
+        try:
+            g =  compute_greeks(
+                S = p["S"], 
+                K = p["K"], 
+                T_days = p["T_days"], 
+                r = p["r"], 
+                sigma = p["sigma"], 
+                option_type = p["option_type"], 
+                quantity = p["quantity"], 
+                spc = p["spc"], 
+                q = p["q"], 
+            )
+            our_thv   = g["bs_price"]
+            our_delta = g["delta_dollar"]
+            our_vega  = g["vega_dollar"]
+        except Exception:
+            our_thv = our_delta = our_vega = None
+        
+        drm_thv   = p.get("drm_thv")
+        drm_delta = p.get("drm_delta_dollars")
+        drm_vega  = p.get("drm_vega")
+
+        thv_diff = (our_thv - drm_thv
+                    if our_thv is not None and drm_thv is not None
+                    else None)
+        
+        qty_color = RED if p["quantity"] < 0 else GREEN
+
+        _cell(ws, r,  1, p["symbol"], bold=True, align="left", bg=bg)
+        _cell(ws, r,  2, p["option_type"].upper(), bg=bg)
+        _cell(ws, r,  3, p["quantity"], fmt="#,##0.00",
+              color=qty_color, bg=bg)
+        _cell(ws, r,  4, p["S"], fmt="#,##0.00", bg=bg)
+        _cell(ws, r,  5, p["K"], fmt="#,##0.00", bg=bg)
+        _cell(ws, r,  6, p["T_days"], fmt="0.00", bg=bg)
+        _cell(ws, r,  7, p["sigma"], fmt="0.000", bg=bg)
+        _cell(ws, r,  8, our_thv, fmt="#,##0.0000", bg=bg)
+        _cell(ws, r,  9, drm_thv, fmt="#,##0.0000", bg=bg)
+        _cell(ws, r, 10, thv_diff, fmt="+#,##0.0000;-#,##0.0000",
+              color=RED if thv_diff and abs(thv_diff) > 1 else "000000",
+                                                                      bg=bg)
+        _cell(ws, r, 11, our_delta, fmt="#,##0", bg=bg)
+        _cell(ws, r, 12, drm_delta, fmt="#,##0", bg=bg)
+        _cell(ws, r, 13, our_vega, fmt="#,##0", bg=bg)
+        _cell(ws, r, 14, drm_vega, fmt="#,##0", bg=bg)
+    
+     # Note row
+    note_row = len(positions) + 4
+    note = ws.cell(row=note_row, column=1,
+                   value="Note: MAGS positions excluded (non-SPX underlying). "
+                         "The current THV uses Black-Scholes with q=0 (no dividend yield).")
+    note.font = Font(italic=True, color="666666", name="Calibri", size=9)
+    note.alignment = Alignment(wrap_text=True)
+    ws.merge_cells(start_row = note_row, start_column = 1,
+                   end_row = note_row, end_column = 14)
+
+# ======================================================
+# Sheet 10 — Fund VaR (account mode only)
+# ======================================================
+def _make_fund_var_chart(var_result: dict, 
+                         account: str, 
+                         horizon_days: int) -> str:
+    """
+    Build the fund return distribution histogram with VaR marked.
+    Returns the path to the saved PNG
+    """
+    dist = var_result["fund_var_dist"]
+    fv1 = var_result["fund_var_1day"]
+
+    fig, ax = plt.subplots(figsize = (10, 4.5))
+
+    ax.hist(dist.values, bins = 60, color = "#1F77B4", 
+            edgecolor = "white", linewidth = 0.3, alpha = 0.85)
+    ax.axvline(fv1, color = "#C00000", linewidth = 1.8, 
+               linestyle = "--", 
+               label = f"Fund VaR (1%): {fv1:.4%}")
+    ax.set_title(
+        f"{account.upper()} — Fund Return Distribution  "
+        f"({len(dist):,} scenarios)\n"
+        f"Range: [{dist.min():.4f},  {dist.max():.4f}]  "
+        f"Mean={dist.mean():.5f}  Std={dist.std():.5f}",
+        fontsize=10, fontweight="bold")
+    ax.set_xlabel("Fund Return", fontsize=9)
+    ax.set_ylabel("Frequency",   fontsize=9)
+    ax.xaxis.set_major_formatter(
+        mticker.PercentFormatter(xmax=1, decimals=2))
+    ax.legend(fontsize=9)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(True, linestyle="--", alpha=0.35)
+    fig.tight_layout()
+
+    return _save_fig(fig, "fund_var_dist.png")
+
+def _write_fund_var(wb: Workbook, var_result: dict, 
+                    account_meta: dict, horizon_days: int):
+    """
+    Write the Fund VaR sheet: comparison table + distribution chart
+    """
+    ws = wb.create_sheet("Fund VaR")
+    ws.sheet_view.showGridlines = False
+
+    account = account_meta.get("account", "").upper()
+    _section_title(ws, 1,1, 
+                   f"Fund-Level VaR — {account} "
+                   f"(Black-Scholes Repricing, Full History Scenarios)", 6)
+    
+    # --- Comparoson table ---
+    _section_title(ws, 3, 1, "VaR Comparison 0ù Current model vs DRM Workbook", 6)
+
+    headers = ["Metric", "Current Model", "DRM Workbook", "Difference", 
+                "Direction", "Note"]
+    widths = [30, 18, 18, 14, 14, 30]
+    for c, (h, w) in enumerate(zip(headers, widths), 1):
+        _hdr(ws, 4, c, h, w)
+    
+    fv1 = var_result["fund_var_1day"]
+    fvs = var_result["fund_var_scaled"]
+    rat = var_result["fund_var_ratio"]
+    hs1 = var_result["hs_var_1day"]
+    hss = var_result["hs_var_scaled"]
+
+    drm_fv1 = account_meta.get("drm_fund_var_1d")
+    drm_fvs = account_meta.get("drm_fund_var_20d")
+    drm_rat = account_meta.get("drm_var_ratio")
+    drm_iv1 = account_meta.get("drm_idx_var_1d")
+    drm_ivs = account_meta.get("drm_idx_var_20d")
+
+    def diff_color(d):
+        return RED if d and d < 0 else GREEN
+    
+    rows = [
+       ("Fund VaR 1-Day",
+         fv1, drm_fv1,
+         fv1 - drm_fv1 if drm_fv1 else None,
+         "0.000%"),
+        (f"Fund VaR {horizon_days}-Day",
+         fvs, drm_fvs,
+         fvs - drm_fvs if drm_fvs else None,
+         "0.000%"),
+        ("SPX Index VaR 1-Day",
+         hs1, drm_iv1,
+         hs1 - drm_iv1 if drm_iv1 else None,
+         "0.000%"),
+        (f"SPX Index VaR {horizon_days}-Day",
+         hss, drm_ivs,
+         hss - drm_ivs if drm_ivs else None,
+         "0.000%"),
+        ("VaR Ratio (Fund / SPX)",
+         rat, drm_rat,
+         rat - drm_rat if drm_rat else None,
+         "0.0000"), 
+    ]
+
+    for r, (label, ours, drm, diff, fmt) in enumerate(rows, 5):
+        bg = GRAY if r % 2 == 0 else None
+        _cell(ws, r, 1, label, bold=True, align="left", bg=bg)
+        _cell(ws, r, 2, ours, fmt=fmt, color=RED, bg=bg)
+        _cell(ws, r, 3, drm, fmt=fmt, color=RED, bg=bg)
+        _cell(ws, r, 4, diff, fmt="+0.000%;-0.000%",
+              color=diff_color(diff), bg=bg)
+        
+        # Direction 
+        if ours is not None and drm is not None:
+            direction = "Current < DRM" if abs(ours) < abs(drm) else "Current > DRM"
+        else:
+            direction = "—"
+        _cell(ws, r, 5, direction, bg = bg)
+
+        # --- Distribution Stats ---
+        dist = var_result["fund_var_dist"]
+        stat_row = note_row = 7 //2 + 3
+        _section_title(ws, stat_row, 1, 
+                       "Fund Return Distribution Statistics", 4)
+        stats = [
+            ("Scenarios", len(dist), "#,##0"),
+            ("Positions repriced", var_result["fund_n_scenarios"], "#,##0"),
+            ("Portfolio value", var_result["fund_portfolio_value"], "$#,##0"),
+            ("SPY multiplier", var_result["fund_spy_multiplier"], "0.0000"),
+            ("Min fund return", dist.min(), "0.0000%"),
+            ("Max fund return", dist.max(), "0.0000%"),
+            ("Mean fund return", dist.mean(), "0.0000%"),
+            ("Std dev", dist.std(), "0.0000%"),
+            ("1st percentile", float(np.percentile(dist, 1)), "0.0000%"),
+        ]
+
+        for i, (label, val, fmt) in enumerate(stats, stat_row + 1):
+            bg = GRAY if i % 2 == 0 else None
+            ws.cell(row=i, column=1, value=label).font = Font(bold=True, name="Calibri", size=10)
+            ws.cell(row=i, column=1).fill = PatternFill("solid", fgColor=D_GRAY if bg else GRAY)
+            ws.cell(row=i, column=1).border = THIN_BORDER
+            _cell(ws, i, 2, val, fmt = fmt, bg=bg)
+        
+        return ws         
+            
+# ======================================================
 # Cache helpers 
 # ======================================================
 def load_or_run_backtest(spx: pd.DataFrame, 
@@ -767,7 +1023,8 @@ def export(spx: pd.DataFrame,
            beta: float = 1.0, 
            vol_multiplier: float = 2.0, 
            output_path: str = None, 
-           cache_path: str = None):
+           cache_path: str = None, 
+           account_data: dict = None):
     """
     Run the full export pipeline and write the Excel workbook.
 
@@ -787,9 +1044,8 @@ def export(spx: pd.DataFrame,
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_file = output_path or os.path.join(script_dir, OUTPUT_FILE)
     cache_path = cache_path or os.path.join(script_dir, cache_file)
-    _ensure_chart_dir() 
-
     
+    _ensure_chart_dir() 
 
     # --- window data for the most recent date ---
     print("\n[Export] Building window data...")
@@ -799,8 +1055,18 @@ def export(spx: pd.DataFrame,
 
     # --- VaR for the most recent date ---
     print("[Export] Computing latest VaR...")
+    positions = account_data["positions"] if account_data else None
+    scenario_levels = account_data["scenario_levels"] if account_data else None
+    base_spx = account_data["base_spx"] if account_data else None
+
     var_result = compute_var(
-        window_data, confidence=confidence, horizon_days=horizon_days)
+        window_data, 
+        confidence = confidence, 
+        horizon_days = horizon_days, 
+        positions = positions, 
+        scenario_levels = scenario_levels, 
+        base_spx = base_spx, 
+    )
     mc_simulated = var_result["mc_simulated"]
 
     # --- Rolling backtest (cached) ---
@@ -831,11 +1097,28 @@ def export(spx: pd.DataFrame,
     _write_readme(wb)
     _write_spx_returns(wb, spx)
     _write_var_summary(wb, bt)
-    _write_var_latest(wb, bt, confidence, horizon_days)
+    _write_var_latest(wb, bt, confidence, horizon_days, 
+                      var_result = var_result, 
+                      account_meta = account_data["metadata"] if account_data else None)
     _write_stress_test(wb, stress_result)
     _write_return_stats(wb, spx, lookback_years, outlier_cutoff)
     _write_var_chart(wb, var_chart_path)
     _write_distributions(wb, dist_chart_paths)
+
+     # Account-specific sheets — only when an account was selected
+    if account_data and var_result.get("fund_var_1day") is not None:
+        account_name = account_data["metadata"]["account"]
+        print("[Export] Writing Positions sheet...")
+        _write_positions(wb, account_data["positions"], account_name)
+
+        print("[Export] Writing Fund VaR sheet...")
+        fund_chart_path = _make_fund_var_chart(
+            var_result, account_name, horizon_days)
+        ws_fv = _write_fund_var(
+            wb, var_result, account_data["metadata"], horizon_days)
+        img = XLImage(fund_chart_path)
+        img.anchor = "A30"
+        ws_fv.add_image(img)
 
     wb.save(output_file)
     print(f"[Export] Workbook saved -> {output_file}")
@@ -851,6 +1134,7 @@ if __name__ == "__main__":
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, csv_filename)
+    worksheet_dir = os.path.join(script_dir, worksheet_folder)
 
     print("\n" + "=" * 65)
     print("DRM ANALYSIS — EXCEL EXPORT")
@@ -860,7 +1144,25 @@ if __name__ == "__main__":
     print(f"SPX data loaded: {len(spx):,} days "
           f"({spx['date'].min().date()} -> {spx['date'].max().date()})")
     
-    output_path = export(spx)
+    # --- Account Selection ---
+    selected = prompt_account_selection(worksheet_dir)
+
+    account_data = None
+    if selected:
+        # Ask for scenario generation parameters
+        n_secenarios, outlier_cutoff = prompt_scenario_parameters()
+        account_data = load_account(
+            filepath = selected["filepath"], 
+            spx = spx, 
+            n_scenarios = n_secenarios, 
+            outlier_cutoff = outlier_cutoff, 
+            seed = 123
+        )
+    else:
+        print("\n Running in SPX-only mode.")
+    
+    # Run all export pipeline
+    output_path = export(spx, account_data = account_data)
 
     print("\n" + "=" * 65)
     print("EXPORT COMPLETE")

@@ -107,12 +107,135 @@ def mc_var(filtered_pool: pd.Series,
     }
 
 #======================================================
+# Method C — Fund-Level VaR 
+#======================================================  
+def fund_var(positions: list, 
+             scenario_levels: "pd.Series", 
+             base_spx: float, 
+             confidence: float = default_confidence, 
+             horizon_days: int = default_horizon_days) -> dict:
+    """
+    Compute fund-level VaR by repricing all option positions 
+    under each simulated SPX scenario.
+
+    HOW IT WORKS
+    ------------
+    For each of the N scenario SPX levels:
+        1. Derive the scenario price for each position's underlying:
+           SPX/SPXW/XSP: use scenario_spx directly
+           SPY: use scenario_spx/spy_multiplier
+        2. Reprice each option using Black-Scholes:
+           S = scenario price, T = T_days - 1 (one day passes)
+        3. P&L per position = (new_price - base_price) * qty * spc
+        4. Sum P&L across positions = portfolio P&L in dollars
+        5. Divide by portfolio gross value = fund return (%)
+    Sort the N fund returns and read the 1st percentile = fund VaR.
+
+    Parameters: 
+        - positions: list of position dicts from read_positions.py
+        - scenario_levels: pd.Series of simulated SPX levels.
+        - base_spx: today's SPX closing level
+        - confidence: VaR confidence level 
+        - horizon_days: scaling horizon in trading days
+
+    Retirns:
+    dict with keys:
+        var_1day — 1-day fund VaR 
+        var_scaled — VaR scaled to horizon_days
+        distribution — pd.Series of N fund returns 
+        n_scenarios — number of scenarios run
+        n_positions — number of positions repriced
+        portfolio_value — gross portfolio value used as denominator
+        spy_multiplier — SPX/SPY ratio derived from position data 
+    """
+    from greeks import bs_price
+
+    # ratio = base_spx\spy_hedgeprice
+    spy_prices = [p["S"] for p in positions if p["underlying"] == "spy"]
+    spy_multiplier = base_spx/spy_prices[0] if spy_prices else 10.029
+
+    # Portfolio gross value — denominator for fund return calculation.
+    # Use DRM PosnDollars where available, else compute from inputs.
+    net_posn = sum(
+        p["drm_posn_dollars"] for p in positions
+        if p["drm_posn_dollars"] is not None)
+    # Fallback: if PosnDollars not available, estimate from inputs
+    if net_posn == 0:
+        net_posn = sum(p["S"]*p["quantity"]*p["spc"] for p in positions)
+    portfolio_value = abs(net_posn)
+
+    # --- Reprice every position under every scenario ---
+    fund_returns = []
+
+    for spx_level in scenario_levels:
+
+        total_pl = 0.0
+
+        for p in positions:
+
+            # scenario underlying price
+            if p["underlying"] in ("spx", "xsp"):
+                S_new = float(spx_level)
+            elif p["underlying"] == "spy":
+                S_new = float(spx_level)/spy_multiplier
+            else: 
+                continue
+
+            # Time remaining after one day passes
+            T_new = p["T_days"] - 1.0
+
+            if T_new <= 0:
+                # Expired
+                if p["option_type"] == "call":
+                    new_price = max(S_new - p["K"], 0.0)
+                else:
+                    new_price = max(p["K"] - S_new, 0.0)
+            else:
+                try:
+                    new_price = bs_price(
+                        S = S_new,
+                        K = p["K"],
+                        T = T_new / 252.0,
+                        r = p["r"],
+                        sigma = p["sigma"],
+                        option_type = p["option_type"],
+                        q = p["q"],
+                    )
+                except Exception:
+                    new_price = p["S"]
+            
+            # P&L = (new option price - base option price)*qty*spc
+            base_price = p.get("base_price", p["S"])
+            total_pl += (new_price - base_price)*p["quantity"]*p["spc"]
+        
+        fund_returns.append(
+            total_pl/portfolio_value if portfolio_value != 0 else 0.0)
+    
+    distribution = pd.Series(sorted(fund_returns))
+    significance = (1 - confidence)*100 
+    var_1day = float(np.percentile(distribution, significance))
+    var_scaled = var_1day*np.sqrt(horizon_days)
+
+    return {
+        "var_1day": var_1day,
+        "var_scaled": var_scaled,
+        "distribution": distribution,
+        "n_scenarios": len(scenario_levels),
+        "n_positions": len(positions),
+        "portfolio_value": portfolio_value,
+        "spy_multiplier": spy_multiplier,
+    }
+
+#======================================================
 # Combined Results
 #======================================================  
 def compute_var(window_data: dict, 
                confidence: float = default_confidence, 
                horizon_days: int = default_horizon_days, 
-               seed: int = random_seed) -> dict:
+               seed: int = random_seed, 
+               positions: list = None, 
+               scenario_levels: "pd.Series" = None, 
+               base_spx: float = None) -> dict:
     """
     Run both VaR methods and package the results together.
 
@@ -122,10 +245,17 @@ def compute_var(window_data: dict,
         - confidence: VaR confidence level
         - horizon_days: time horizon in trading days
         - seed: random seed for MC
+        - positions: list of position dicts from read_positions.py
+          When provided, fund_var() is computed. When None, 
+          only HS and MC VaR are computed.
+        - scenario_levels: pd.Series of simulated SPX levels
+          Required when positions is provided.
+        - base_spx: today's SPX level (required with positions)
+
  
     Returns:
     
-        dict with all results from both methods and a comparison.
+        dict with HS, MC, and optionally fund VaR results.
     """
     # Historical simulation 
     hs = hs_var(
@@ -145,7 +275,7 @@ def compute_var(window_data: dict,
     diff_1day = mc["var_1day"] - hs["var_1day"]
     diff_scaled = mc["var_scaled"] - hs["var_scaled"]
 
-    return {
+    result = {
         "as_of_date": window_data["as_of_date"],
         "confidence": confidence,
         "lookback_years": window_data["lookback_years"],
@@ -163,8 +293,36 @@ def compute_var(window_data: dict,
         "diff_scaled": diff_scaled,
         "diff_1day_bps": diff_1day*10_000,
         "diff_scaled_bps": diff_scaled*10_000,
+        "fund_var_1day": None,
+        "fund_var_scaled": None,
+        "fund_var_dist": None,
+        "fund_var_ratio": None,
+        "fund_n_scenarios": None,
+        "fund_portfolio_value": None,
+        "fund_spy_multiplier": None,
     }
 
+    # Run fund VaR only when positions and scenario_levels are supplied
+    if positions and scenario_levels is not None and base_spx is not None:
+        print(" [Fund VaR] Repricing positions under each scenario...")
+        fv = fund_var(
+            positions = positions, 
+            scenario_levels = scenario_levels, 
+            base_spx = base_spx, 
+            confidence = confidence, 
+            horizon_days = horizon_days, 
+        )
+        result["fund_var_1day"] = fv["var_1day"]
+        result["fund_var_scaled"] = fv["var_scaled"]
+        result["fund_var_dist"] = fv["distribution"]
+        result["fund_n_scenarios"] = fv["n_scenarios"]
+        result["fund_portfolio_value"] = fv["portfolio_value"]
+        result["fund_spy_multiplier"] = fv["spy_multiplier"]
+        # VaR ratio: fund VaR/SPX HS-VaR
+        if hs["var_1day"] != 0:
+            result["fund_var_ratio"] = fv["var_1day"]/hs["var_1day"]
+    
+    return result
 #======================================================
 # Scale to arbitrary horizon
 #======================================================  
@@ -190,69 +348,112 @@ def print_var_report(r: dict) -> None:
     Print the VaR report
     """
     h = r["horizon_days"]
+
+
+    # --- Fund VaR section — only shown when positions were provided ---
+    if r.get("fund_var_1day") is not None:
+        fv1  = r["fund_var_1day"]
+        fvs  = r["fund_var_scaled"]
+        rat  = r["fund_var_ratio"]
+        dist = r["fund_var_dist"]
+
+        print(f"\n" + "=" * 65)
+        print(f"  FUND-LEVEL VaR  (position repricing)")
+        print("=" * 65)
+        print(f"  Scenarios run: {r['fund_n_scenarios']:,}")
+        print(f"  Positions repriced: {r['fund_n_scenarios']} x "
+              f"{len(r['fund_var_dist'])} fund returns")
+        print(f"  Portfolio value: ${r['fund_portfolio_value']:>15,.0f}")
+        print(f"  SPY multiplier: {r['fund_spy_multiplier']:.4f}")
+
+        print(f"\n  {'METHOD':<30}  {'1-Day VaR':>11}  {f'{h}-Day VaR':>11}")
+        print(f"  {'-'*57}")
+        print(f"  {'Our fund VaR':<30}  {fv1:>10.4%}  {fvs:>10.4%}")
+        print(f"  {'SPX HS-VaR (benchmark)':<30}  "
+              f"{r['hs_var_1day']:>10.4%}  {r['hs_var_scaled']:>10.4%}")
+        print(f"\n  VaR Ratio (fund / SPX)  : {rat:.4f}  "
+              f"({'fund < index' if abs(fv1) < abs(r['hs_var_1day']) else 'fund > index'})")
+
+        print(f"\n  FUND RETURN DISTRIBUTION ({len(dist):,} scenarios)")
+        print(f"  {'Range':<30} [{dist.min():.5f},  {dist.max():.5f}]")
+        print(f"  {'Mean':<30} {dist.mean():.7f}")
+        print(f"  {'Std deviation':<30} {dist.std():.7f}")
+
+        worst_fund = dist.values[:10]
+        print(f"\n  LEFT TAIL — 10 worst fund returns")
+        print(f"  {'  '.join(f'{v:.5f}' for v in worst_fund)}")
+
+        print(f"\n  NOTE: Our scenarios are capped at ±{r['outlier_cutoff']:.1%}.")
+        print(f"  The DRM system uses wider scenarios (up to ~±9%).")
+        print(f"  To narrow the gap, increase the outlier cutoff when prompted.")
+
     print("\n" + "=" * 65)
-    print("STEP 3 — VaR RESULTS")
+    print("  VaR RESULTS")
     print("=" * 65)
-    print(f"\nCalculation date: {r['as_of_date'].date()}")
-    print(f"Confidence level: {r['confidence']:.0%}")
-    print(f"Lookback window: {r['lookback_years']} year(s)")
-    print(f"Outlier cutoff: ± {r['outlier_cutoff']:.1%}")
-    print(f"Horizon: {h} trading day(s)  "
-          f"(√{h} = {np.sqrt(h):.4f})")
- 
-    # Warning for long horizons where sqrt(T) loses reliability
+    print(f"\n  Calculation date: {r['as_of_date'].date()}")
+    print(f"  Confidence level: {r['confidence']:.0%}")
+    print(f"  Lookback window: {r['lookback_years']} year(s)")
+    print(f"  Outlier cutoff: ± {r['outlier_cutoff']:.1%}")
+    print(f"  Horizon: {h} trading day(s)  (√{h} = {np.sqrt(h):.4f})")
+
     if h > 30:
-        print(f"\n [Note] Horizon > 30 days: the sqrt(T) scaling rule becomes")
-        print(f"less reliable here. Treat the {h}-day VaR as an approximation.")
- 
+        print(f"\n  [Note] Horizon > 30 days: sqrt(T) scaling becomes less")
+        print(f"  reliable. Treat the {h}-day VaR as an approximation.")
+
     print(f"\n  {'METHOD':<34}  {'1-Day VaR':>11}  {f'{h}-Day VaR':>11}")
     print(f"  {'-'*61}")
- 
+
     print(f"  {'A. Historical Simulation':<34}"
           f"  {r['hs_var_1day']:>10.4%}"
           f"  {r['hs_var_scaled']:>10.4%}")
     print(f"     observations used : {r['hs_n_obs']:,}")
- 
+
     print(f"\n  {'B. Monte Carlo Simulation':<34}"
           f"  {r['mc_var_1day']:>10.4%}"
           f"  {r['mc_var_scaled']:>10.4%}")
-    print(f"     pool size  : {r['mc_n_pool']:,}  (full window minus outliers)")
-    print(f"     draws      : {r['mc_n_draws']:,}")
- 
-    print(f"\nCOMPARISON  (MC minus HS)")
-    print(f"{'1-Day  difference':<34}"
-          f"{r['diff_1day']:>10.4%}"
-          f"({r['diff_1day_bps']:>+.1f} bps)")
-    print(f"{f'{h}-Day difference':<34}"
-          f"{r['diff_scaled']:>10.4%}"
-          f"({r['diff_scaled_bps']:>+.1f} bps)")
- 
+    print(f"     pool size: {r['mc_n_pool']:,}  (full window minus outliers)")
+    print(f"     draws: {r['mc_n_draws']:,}")
+
+    print(f"\n  COMPARISON  (MC minus HS)")
+    print(f"  {'1-Day  difference':<34}"
+          f"  {r['diff_1day']:>10.4%}"
+          f"  ({r['diff_1day_bps']:>+.1f} bps)")
+    print(f"  {f'{h}-Day difference':<34}"
+          f"  {r['diff_scaled']:>10.4%}"
+          f"  ({r['diff_scaled_bps']:>+.1f} bps)")
+
     if abs(r["diff_1day_bps"]) > 20:
-        print(f"\n[Note] Difference > 20 bps — consider increasing MC draws.")
+        print(f"\n  [Note] Difference > 20 bps — consider increasing MC draws.")
     else:
-        print(f"\nMethods are consistent (difference within 20 bps). (OK)")
- 
-    print(f"\nINTERPRETATION")
-    print(f"Based on the past {r['lookback_years']} year(s) of SPX returns:")
-    print(f"- On {r['confidence']:.2%} of days, SPX should not lose more than "
-          f"{abs(r['hs_var_1day']):.2%} in a single day (HS)")
-    print(f" - On {r['confidence']:.2%} of days, SPX should not lose more than "
-          f"{abs(r['mc_var_1day']):.2%} in a single day (MC)")
-    print(f" - Over {h} trading days, the threshold becomes "
-          f"{abs(r['hs_var_scaled']):.2%} (HS)")
- 
+        print(f"\n  Methods are consistent (difference within 20 bps).  (OK)")
+
+    print(f"\n  INTERPRETATION")
+    print(f"  Based on the past {r['lookback_years']} year(s) of SPX returns:")
+    print(f"  - On {r['confidence']:.0%} of days, loss will not exceed "
+          f"{abs(r['hs_var_1day']):.2%} in a single day  (HS)")
+    print(f"  - On {r['confidence']:.0%} of days, loss will not exceed "
+          f"{abs(r['mc_var_1day']):.2%} in a single day  (MC)")
+    print(f"  - Over {h} trading days, the threshold becomes "
+          f"{abs(r['hs_var_scaled']):.2%}  (HS)")
+
     sim = r["mc_simulated"]
-    print(f"\n  MC SIMULATED DISTRIBUTION ({r['mc_n_draws']:,} draws)")
-    print(f"{'Range':<30} [{sim.min():.5f}, {sim.max():.5f}]")
-    print(f"{'Mean':<30} {sim.mean():.7f}")
-    print(f"{'Std deviation':<30} {sim.std():.7f}")
- 
-    n_tail    = max(10, int((1 - r['confidence'])*r['mc_n_draws']) + 1)
+    print(f"\n  MC SIMULATED DISTRIBUTION  ({r['mc_n_draws']:,} draws)")
+    print(f"  {'Range':<30} [{sim.min():.5f},  {sim.max():.5f}]")
+    print(f"  {'Mean':<30} {sim.mean():.7f}")
+    print(f"  {'Std deviation':<30} {sim.std():.7f}")
+
+    # Correct left tail slice: significance% of mc_draws
+    # e.g. 1% of 944 = 9.44 → show the 10 worst
+    n_tail = max(10, int((1 - r["confidence"]) * r["mc_n_draws"]) + 1)
     worst_sim = np.sort(sim)[:n_tail]
-    print(f"\nLEFT TAIL — {len(worst_sim)} worst simulated returns")
-    print(f"(MC-VaR read from position ~{int((1 - r['confidence'])*r['mc_n_draws'])} of sorted array)")
-    print(f"{'  '.join(f'{v:.5f}' for v in worst_sim)}")
- 
+    print(f"\n  LEFT TAIL — {n_tail} worst simulated returns")
+    print(f"  (MC-VaR read from position ~{int((1-r['confidence'])*r['mc_n_draws'])} "
+          f"of sorted array)")
+    print(f"  {'  '.join(f'{v:.5f}' for v in worst_sim)}")
+
+    print("\n" + "=" * 65)
+    print("  VaR calculation complete.")
+    print("=" * 65)
 #======================================================
 # User Input
 #======================================================  
@@ -264,13 +465,13 @@ def prompt_all_parameters() -> tuple:
     # First three parameters reuse the existing prompt from previous step. 
     lookback_years, outlier_cutoff, mc_draws = prompt_parameters()
     # Add the new horizon parameter
-    raw = int(input(f"\nVaR horizon in trading days "
-        f"[default = {default_horizon_days}]: ").strip())
+    raw = input(f"\nVaR horizon in trading days "
+        f"[default = {default_horizon_days}]: ").strip()
     if raw == "":
         horizon_days = default_horizon_days
     else:
         try:
-            horizon_days = raw
+            horizon_days = int(raw)
             if horizon_days < 1 or horizon_days > 252:
                 print("Out of range (1-252). Using default.")
                 horizon_days = default_horizon_days
@@ -283,14 +484,15 @@ def prompt_all_parameters() -> tuple:
              f"approximation beyond this point.")
     print(f"  Horizon set to: {horizon_days} trading day(s)  "
           f"(√{horizon_days} = {np.sqrt(horizon_days):.4f})\n")
-
-    raw = float(input(f"Confidence Interval (0.90 - 0.99) "
-                     f"[default = {default_confidence}]: ").strip())
+    
+    # --- Confidence ---
+    raw = input(f"Confidence Interval (0.90 - 0.99) "
+                     f"[default = {default_confidence}]: ").strip()
     if raw == "":
         confidence = default_confidence
     else:
         try:
-            confidence = raw
+            confidence = float(raw)
             if confidence < 0.90 or confidence > 0.99:
                 print("Out of range (0.90 - 0.99). Using default.")
                 confidence = default_confidence
@@ -304,6 +506,7 @@ def prompt_all_parameters() -> tuple:
 # Entry Point
 #====================================================== 
 if __name__ == "__main__":
+    
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, csv_filename)
 
