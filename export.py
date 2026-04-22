@@ -84,7 +84,7 @@ THIN_BORDER = Border(
 def _hdr(ws, row: int, col: int, value, width: int = None):
     """Write a navy header cell."""
     c = ws.cell(row=row, column=col, value=value)
-    c.font = Font(bold=True, color=WHITE, name="Calibri", size=10)
+    c.font = Font(bold=True, color=WHITE, name="Arial", size=10)
     c.fill = PatternFill("solid", fgColor=NAVY)
     c.alignment = Alignment(horizontal="center", vertical="center",
                              wrap_text=True)
@@ -100,7 +100,7 @@ def _cell(ws, row: int, col: int, value,
           align: str = "center"):
     """Write a data cell."""
     c = ws.cell(row=row, column=col, value=value)
-    c.font = Font(color=color, name="Calibri", size=10, bold=bold)
+    c.font = Font(color=color, name="Arial", size=10, bold=bold)
     c.alignment = Alignment(horizontal=align, vertical="center")
     c.border = THIN_BORDER
     if fmt:
@@ -113,7 +113,7 @@ def _cell(ws, row: int, col: int, value,
 def _section_title(ws, row: int, col: int, value: str, n_cols: int = 1):
     """Write a section title spanning n_cols columns."""
     c = ws.cell(row=row, column=col, value=value)
-    c.font = Font(bold=True, color=NAVY, name="Calibri", size=11)
+    c.font = Font(bold=True, color=NAVY, name="Arial", size=11)
     c.fill = PatternFill("solid", fgColor=L_BLUE)
     c.alignment = Alignment(horizontal="left", vertical="center")
     c.border = THIN_BORDER
@@ -220,7 +220,7 @@ def _write_readme(wb: Workbook):
         else: 
             a.font = Font(bold = True, color = "000000", name = "Arial", size = 10)
             a.fill = PatternFill("solid", fgColor = GRAY)
-            b.font = Font(color = "000000", name = "Calibri", size = 10)
+            b.font = Font(color = "000000", name = "Arial", size = 10)
         b.alignment = Alignment(wrap_text = True, vertical = "top")
         ws.row_dimensions[i].height = 16
 
@@ -377,7 +377,8 @@ def _write_var_latest(wb: Workbook, bt: pd.DataFrame,
 # ======================================================
 # Sheet 5 — Stress test
 # ======================================================
-def _write_stress_test(wb: Workbook, stress_result: dict):
+def _write_stress_test(wb: Workbook, stress_result: dict, 
+                       positions: list = None):
     
     ws = wb.create_sheet("Stress test")
     ws.sheet_view.showGridLines = False
@@ -449,6 +450,45 @@ def _write_stress_test(wb: Workbook, stress_result: dict):
         ws.cell(row = i, column = 1).border = THIN_BORDER
         ws.column_dimensions["A"].width = 34
         _cell(ws, i, 2, val, fmt = fmt)
+    
+    # Per-position Greeks — only when real positions are available
+    if positions:
+        from greeks import compute_greeks
+        pos_greek_row = greeks_row + len(greek_rows) + 3
+        _section_title(ws, pos_greek_row, 1,
+                       "Position-Level Greeks (Base Case)", 7)
+        pg_headers = ["Symbol", "Type", "Qty",
+                      "Delta $", "Gamma $", "Vega $",
+                      "Theta $", "Rho $"]
+        pg_widths  = [22, 5, 10, 14, 14, 12, 12, 12]
+        for c, (h, w) in enumerate(zip(pg_headers, pg_widths), 1):
+            _hdr(ws, pos_greek_row + 1, c, h, w)
+
+        for pr, p in enumerate(positions, pos_greek_row + 2):
+            bg = GRAY if pr % 2 == 0 else None
+            try:
+                g = compute_greeks(
+                    S=p["S"], K=p["K"], T_days=p["T_days"],
+                    r=p["r"], sigma=p["sigma"],
+                    option_type=p["option_type"],
+                    quantity=p["quantity"], spc=p["spc"], q=p["q"])
+                delta = g["delta_dollar"]
+                gamma = g["gamma_dollar"]
+                vega  = g["vega_dollar"]
+                theta = g["theta_dollar"]
+                rho   = g["rho_dollar"]
+            except Exception:
+                delta = gamma = vega = theta = rho = None
+            qty_color = RED if p["quantity"] < 0 else GREEN
+            _cell(ws, pr, 1, p["symbol"], bold=True, align="left", bg=bg)
+            _cell(ws, pr, 2, p["option_type"].upper(), bg=bg)
+            _cell(ws, pr, 3, p["quantity"], fmt="#,##0.00",
+                  color=qty_color, bg=bg)
+            _cell(ws, pr, 4, delta, fmt="#,##0", bg=bg)
+            _cell(ws, pr, 5, gamma, fmt="#,##0.0000", bg=bg)
+            _cell(ws, pr, 6, vega,  fmt="#,##0", bg=bg)
+            _cell(ws, pr, 7, theta, fmt="#,##0.00", bg=bg)
+            _cell(ws, pr, 8, rho,   fmt="#,##0.00", bg=bg)
 
 # ======================================================
 # Sheet 6 — Return Statistics
@@ -750,14 +790,18 @@ def _write_positions(wb: Workbook, positions: list, account: str):
     _section_title(ws, 1, 1, 
                    f"Option Positions — {account.upper()}  "
                    f"(VAR0000 Base Case, MAGS excluded)", 14)
+    
     headers = ["Symbol", "Type", "Qty", "Underlying $",
                "Strike", "T Days", "Sigma",
-               "Our THV", "DRM THV", "THV Diff",
-               "Our Delta $", "DRM Delta $",
-               "Our Vega", "DRM Vega"]
+               "Current THV", "DRM THV", "THV Diff",
+               "Current Delta $", "DRM Delta $",
+               "Current Vega", "DRM Vega",
+               "Current Theta", "DRM Theta",
+               "Current Rho", "DRM Rho"]
+    
     widths = [22, 5, 10, 13, 10, 8, 7,
               12, 12, 10, 13, 13,
-              11, 11 ]
+              11, 11, 11, 11, 11, 11]
     
     for c, (h, w) in enumerate(zip(headers, widths), 1):
         _hdr(ws, 2, c, h, w)
@@ -767,7 +811,7 @@ def _write_positions(wb: Workbook, positions: list, account: str):
 
         # Compute Greeks
         try:
-            g =  compute_greeks(
+            g = compute_greeks(
                 S = p["S"], 
                 K = p["K"], 
                 T_days = p["T_days"], 
@@ -781,12 +825,16 @@ def _write_positions(wb: Workbook, positions: list, account: str):
             our_thv   = g["bs_price"]
             our_delta = g["delta_dollar"]
             our_vega  = g["vega_dollar"]
+            our_theta = g["theta_dollar"]
+            our_rho   = g["rho_dollar"]
         except Exception:
-            our_thv = our_delta = our_vega = None
+            our_thv = our_delta = our_vega = our_theta = our_rho =  None
         
         drm_thv   = p.get("drm_thv")
         drm_delta = p.get("drm_delta_dollars")
         drm_vega  = p.get("drm_vega")
+        drm_theta = p.get("drm_theta")
+        drm_rho   = p.get("drm_rho")
 
         thv_diff = (our_thv - drm_thv
                     if our_thv is not None and drm_thv is not None
@@ -811,16 +859,20 @@ def _write_positions(wb: Workbook, positions: list, account: str):
         _cell(ws, r, 12, drm_delta, fmt="#,##0", bg=bg)
         _cell(ws, r, 13, our_vega, fmt="#,##0", bg=bg)
         _cell(ws, r, 14, drm_vega, fmt="#,##0", bg=bg)
+        _cell(ws, r, 15, our_theta, fmt="#,##0.00", bg=bg)
+        _cell(ws, r, 16, drm_theta, fmt="#,##0.00", bg=bg)
+        _cell(ws, r, 17, our_rho,   fmt="#,##0.00", bg=bg)
+        _cell(ws, r, 18, drm_rho,   fmt="#,##0.00", bg=bg)
     
      # Note row
     note_row = len(positions) + 4
     note = ws.cell(row=note_row, column=1,
                    value="Note: MAGS positions excluded (non-SPX underlying). "
                          "The current THV uses Black-Scholes with q=0 (no dividend yield).")
-    note.font = Font(italic=True, color="666666", name="Calibri", size=9)
+    note.font = Font(italic=True, color="666666", name="Arial", size=9)
     note.alignment = Alignment(wrap_text=True)
     ws.merge_cells(start_row = note_row, start_column = 1,
-                   end_row = note_row, end_column = 14)
+                   end_row = note_row, end_column = 18)
 
 # ======================================================
 # Sheet 10 — Fund VaR (account mode only)
@@ -953,13 +1005,195 @@ def _write_fund_var(wb: Workbook, var_result: dict,
 
         for i, (label, val, fmt) in enumerate(stats, stat_row + 1):
             bg = GRAY if i % 2 == 0 else None
-            ws.cell(row=i, column=1, value=label).font = Font(bold=True, name="Calibri", size=10)
+            ws.cell(row=i, column=1, value=label).font = Font(bold=True, name="Arial", size=10)
             ws.cell(row=i, column=1).fill = PatternFill("solid", fgColor=D_GRAY if bg else GRAY)
             ws.cell(row=i, column=1).border = THIN_BORDER
             _cell(ws, i, 2, val, fmt = fmt, bg=bg)
         
-        return ws         
-            
+        return ws      
+
+# ======================================================
+# Sheet 11 — VaR Detail  (account mode only)
+# ======================================================
+def _write_var_detail(wb: Workbook, positions: list,
+                      scenario_levels: "pd.Series",
+                      base_spx: float, account: str):
+    """
+    For each scenario * position: show the repriced option value
+    and P&L. Replicates the DRM VaR Detail sheet structure.
+    """
+    from greeks import bs_price as _bs
+
+    ws = wb.create_sheet("VaR Detail")
+    ws.sheet_view.showGridLines = False
+
+    spy_prices = [p["S"] for p in positions if p["underlying"] == "spy"]
+    spy_mult = base_spx / spy_prices[0] if spy_prices else 10.029
+    net_posn = sum(p["drm_posn_dollars"] for p in positions
+                        if p["drm_posn_dollars"] is not None)
+    portfolio_val = abs(net_posn) if net_posn else 1.0
+
+    _section_title(ws, 1, 1,
+                   f"VaR Detail — {account.upper()}  "
+                   f"(Base SPX: {base_spx:,.2f}  |  "
+                   f"Portfolio: ${portfolio_val:,.0f})", 9)
+
+    headers = ["Scenario", "SPX Level", "SPX Return",
+               "Symbol", "Type", "Base Price",
+               "New Price", "PL ($)", "PL (%)"]
+    widths = [12, 12, 11, 24, 5, 12, 12, 14, 10]
+    for c, (h, w) in enumerate(zip(headers, widths), 1):
+        _hdr(ws, 2, c, h, w)
+
+    row = 3
+    for i, spx_level in enumerate(scenario_levels):
+        scenario_id = f"VAR{i+1:04d}VR"
+        spx_ret = float(spx_level) / base_spx - 1.0
+        scenario_pl = 0.0
+
+        for p in positions:
+            S_new = (float(spx_level) if p["underlying"] in ("spx","xsp")
+                     else float(spx_level) / spy_mult)
+            T_new = p["T_days"] - 1.0
+            if T_new <= 0:
+                new_price = (max(S_new - p["K"], 0.0)
+                             if p["option_type"] == "call"
+                             else max(p["K"] - S_new, 0.0))
+            else:
+                try:
+                    new_price = _bs(S=S_new, K=p["K"],
+                                    T=T_new/252.0, r=p["r"],
+                                    sigma=p["sigma"],
+                                    option_type=p["option_type"],
+                                    q=p["q"])
+                except Exception:
+                    new_price = p.get("base_price", p["S"])
+
+            base_price = p.get("base_price", p["S"])
+            pl_pos = (new_price - base_price) * p["quantity"] * p["spc"]
+            scenario_pl += pl_pos
+            pl_pct = pl_pos / portfolio_val
+
+            bg = None
+            tc = RED   if pl_pos < 0 else GREEN
+
+            _cell(ws, row, 1, scenario_id, bg=bg)
+            _cell(ws, row, 2, float(spx_level), fmt="#,##0.00", bg=bg)
+            _cell(ws, row, 3, spx_ret, fmt="+0.000%;-0.000%",
+                  color=(RED if spx_ret < 0 else GREEN), bg=bg)
+            _cell(ws, row, 4, p["symbol"], bold=True, align="left", bg=bg)
+            _cell(ws, row, 5, p["option_type"].upper(), bg=bg)
+            _cell(ws, row, 6, base_price, fmt="#,##0.0000", bg=bg)
+            _cell(ws, row, 7, new_price, fmt="#,##0.0000", bg=bg)
+            _cell(ws, row, 8, pl_pos, fmt='#,##0;[Red]-#,##0',
+                  color=tc, bg=bg)
+            _cell(ws, row, 9, pl_pct, fmt="+0.000%;-0.000%",
+                  color=tc, bg=bg)
+            row += 1
+
+    ws.freeze_panes = "A3"
+    ws.auto_filter.ref = "A2:I2"  
+
+ # ======================================================
+# Sheet 12 — Stress Test Full Detail  (account mode only)
+# ======================================================
+def _write_stress_full_detail(wb: Workbook, positions: list,
+                               stress_result: dict, account: str):
+    """
+    For each stress scenario * position: repriced value and P&L.
+    Replicates the DRM Stress Test Full Detail sheet.
+    """
+    from greeks import bs_price as _bs, compute_greeks
+
+    ws = wb.create_sheet("Stress Full Detail")
+    ws.sheet_view.showGridLines = False
+
+    base_spx = stress_result["spx_level"]
+    spy_prices = [p["S"] for p in positions if p["underlying"] == "spy"]
+    spy_mult = base_spx / spy_prices[0] if spy_prices else 10.029
+    net_posn = sum(p["drm_posn_dollars"] for p in positions
+                     if p["drm_posn_dollars"] is not None)
+    portfolio_val = abs(net_posn) if net_posn else 1.0
+
+    _section_title(ws, 1, 1,
+                   f"Stress Test Full Detail — {account.upper()}  "
+                   f"(Base SPX: {base_spx:,.2f}  |  "
+                   f"Portfolio: ${portfolio_val:,.0f})", 11)
+
+    headers = ["Scenario", "Shock %", "SPX Current", "SPX Stressed",
+               "Symbol", "Type", "Base Price", "New Price",
+               "PL ($)", "PL (%)", "Delta $"]
+    widths = [10, 8, 12, 12, 24, 5, 12, 12, 14, 10, 13]
+    for c, (h, w) in enumerate(zip(headers, widths), 1):
+        _hdr(ws, 2, c, h, w)
+
+    row = 3
+    for scenario in stress_result["scenarios"]:
+        rm_code = scenario["rm_code"]
+        shock = scenario["shock"]
+        spx_stressed = base_spx * (1 + shock)
+
+        if shock < 0:
+            bg, tc = None, RED
+        elif shock > 0:
+            bg, tc = None, GREEN
+        else:
+            bg, tc = None, NAVY
+
+        for p in positions:
+            S_new = (spx_stressed if p["underlying"] in ("spx","xsp")
+                     else spx_stressed / spy_mult)
+            T_new = p["T_days"] - 1.0
+            if T_new <= 0:
+                new_price = (max(S_new - p["K"], 0.0)
+                             if p["option_type"] == "call"
+                             else max(p["K"] - S_new, 0.0))
+            else:
+                try:
+                    new_price = _bs(S=S_new, K=p["K"],
+                                    T=T_new/252.0, r=p["r"],
+                                    sigma=p["sigma"],
+                                    option_type=p["option_type"],
+                                    q=p["q"])
+                except Exception:
+                    new_price = p.get("base_price", p["S"])
+
+            base_price = p.get("base_price", p["S"])
+            pl_pos = (new_price - base_price) * p["quantity"] * p["spc"]
+            pl_pct = pl_pos / portfolio_val
+            pl_color = RED if pl_pos < 0 else GREEN
+
+            # Delta at the stressed price
+            try:
+                g = compute_greeks(S=S_new, K=p["K"], T_days=T_new,
+                                   r=p["r"], sigma=p["sigma"],
+                                   option_type=p["option_type"],
+                                   quantity=p["quantity"],
+                                   spc=p["spc"], q=p["q"])
+                delta_stressed = g["delta_dollar"]
+            except Exception:
+                delta_stressed = None
+
+            _cell(ws, row, 1, rm_code, bold=True, color=NAVY, bg=bg)
+            _cell(ws, row, 2, shock, fmt="+0%;-0%",
+                  color=tc, bg=bg)
+            _cell(ws, row, 3, base_spx, fmt="#,##0.00", bg=bg)
+            _cell(ws, row, 4, spx_stressed, fmt="#,##0.00", bg=bg)
+            _cell(ws, row, 5, p["symbol"], bold=True,
+                  align="left", bg=bg)
+            _cell(ws, row, 6, p["option_type"].upper(), bg=bg)
+            _cell(ws, row, 7, base_price, fmt="#,##0.0000", bg=bg)
+            _cell(ws, row, 8, new_price, fmt="#,##0.0000", bg=bg)
+            _cell(ws, row, 9, pl_pos,
+                  fmt='#,##0;[Red]-#,##0', color=pl_color, bg=bg)
+            _cell(ws, row, 10, pl_pct,
+                  fmt="+0.000%;-0.000%", color=pl_color, bg=bg)
+            _cell(ws, row, 11, delta_stressed, fmt="#,##0", bg=bg)
+            row += 1
+
+    ws.freeze_panes = "A3"
+    ws.auto_filter.ref = "A2:K2"
+        
 # ======================================================
 # Cache helpers 
 # ======================================================
@@ -1100,7 +1334,8 @@ def export(spx: pd.DataFrame,
     _write_var_latest(wb, bt, confidence, horizon_days, 
                       var_result = var_result, 
                       account_meta = account_data["metadata"] if account_data else None)
-    _write_stress_test(wb, stress_result)
+    _write_stress_test(wb, stress_result, 
+                       positions = account_data["positions"] if account_data else None)
     _write_return_stats(wb, spx, lookback_years, outlier_cutoff)
     _write_var_chart(wb, var_chart_path)
     _write_distributions(wb, dist_chart_paths)
@@ -1109,7 +1344,9 @@ def export(spx: pd.DataFrame,
     if account_data and var_result.get("fund_var_1day") is not None:
         account_name = account_data["metadata"]["account"]
         print("[Export] Writing Positions sheet...")
-        _write_positions(wb, account_data["positions"], account_name)
+        _write_positions(wb, 
+                         account_data["positions"], 
+                         account_name)
 
         print("[Export] Writing Fund VaR sheet...")
         fund_chart_path = _make_fund_var_chart(
@@ -1119,6 +1356,19 @@ def export(spx: pd.DataFrame,
         img = XLImage(fund_chart_path)
         img.anchor = "A30"
         ws_fv.add_image(img)
+
+        print("[Export] Writing VaR Detail sheet...")
+        _write_var_detail(wb,
+                          account_data["positions"],
+                          account_data["scenario_levels"],
+                          account_data["base_spx"],
+                          account_name)
+
+        print("[Export] Writing Stress Full Detail sheet...")
+        _write_stress_full_detail(wb,
+                                  account_data["positions"],
+                                  stress_result,
+                                  account_name)
 
     wb.save(output_file)
     print(f"[Export] Workbook saved -> {output_file}")
