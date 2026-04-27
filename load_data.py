@@ -2,6 +2,7 @@
 # Load and Prepare the SPX data
 #======================================================
 import pandas as pd 
+import numpy as np
 import os
 
 csv_filename = "spxtr_level_data.csv"
@@ -42,7 +43,7 @@ def load_spx(csv_path: str) -> pd.DataFrame:
     raw = raw.sort_values("date").reset_index(drop = True)
 
     ## Compute daily Retruns ##
-    raw["daily_return"] = raw["close"].pct_change()
+    raw["daily_return"] = np.log(1 + raw["close"].pct_change())
     raw = raw.dropna(subset = ["daily_return"]).reset_index(drop = True)
 
     spx = raw[["date", "close", "daily_return"]].copy()

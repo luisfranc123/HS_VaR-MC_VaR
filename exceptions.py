@@ -59,7 +59,7 @@ def run_backtest(spx: pd.DataFrame,
     Run the full rolling backtest across every available trading day.
 
     For each day:
-        1. extract the trailing lookback_year wondow of returns
+        1. extract the trailing lookback_year window of returns
         2. compute HS-VaR and MC-VaR for that day
         3. compare the actual return against each VaR threshold
         4. record the result
@@ -201,7 +201,7 @@ def compute_exception_stats(bt: pd.DataFrame,
     light_mc = traffic_light(rate_mc, expected_rate)
 
     # --- Binomial p-value ---
-    # scipy.stats.binomtest(k, n, p) computes this exactly.
+    # scipy.stats.binomtest(k, n, p).
     #   k = observed exceptions
     #   n = total days
     #   p = expected probability per day (0.01 for 99% VaR)
@@ -214,7 +214,7 @@ def compute_exception_stats(bt: pd.DataFrame,
                               alternative = 'greater').pvalue
     
     # --- Worst Exceptions ---
-    # the days where the actual return most esceeded the VaR threshold.
+    # the days where the actual return most exceeded the VaR threshold.
     worst_hs = (bt[bt["exception_hs"] == 1]
                 .nsmallest(10, "excess_hs"))[["date", "actual_return", "hs_var_1day", "excess_hs"]]
     worst_mc = (bt[bt["exception_mc"] == 1]

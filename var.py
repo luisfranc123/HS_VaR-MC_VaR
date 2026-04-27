@@ -352,9 +352,9 @@ def print_var_report(r: dict) -> None:
 
     # --- Fund VaR section — only shown when positions were provided ---
     if r.get("fund_var_1day") is not None:
-        fv1  = r["fund_var_1day"]
-        fvs  = r["fund_var_scaled"]
-        rat  = r["fund_var_ratio"]
+        fv1 = r["fund_var_1day"]
+        fvs = r["fund_var_scaled"]
+        rat = r["fund_var_ratio"]
         dist = r["fund_var_dist"]
 
         print(f"\n" + "=" * 65)

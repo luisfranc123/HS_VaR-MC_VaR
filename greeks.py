@@ -234,7 +234,7 @@ def compute_greeks(S: float,
     gamma_unit = bs_gamma(S, K, T_years, r, sigma, q)
     vega_unit = bs_vega( S, K, T_years, r, sigma, q)
     theta_unit = bs_theta(S, K, T_years, r, sigma, option_type, q)
-    rho_unit = bs_rho(  K, T_years, r, d2, option_type)
+    rho_unit = bs_rho(K, T_years, r, d2, option_type)
 
     # Position size: total shares represented by all contracts
     position_size = quantity*spc
